@@ -4,7 +4,6 @@ import random
 import sys
 import time
 from glob import glob
-from shutil import copyfile, move
 
 import numpy as np
 import torch
@@ -71,7 +70,7 @@ def eval(args):
     os.makedirs(args.target_dir, exist_ok=True)
 
     eval_psnr_list, eval_msssim_list = [], []
-    eval_rate_list, dec_time_list = [], []
+    eval_rate_list, eval_time_list = [], []
 
     psnr = PSNR(reduction='mean', data_range=255.)
     ms_ssim = MS_SSIM(reduction='mean', data_range=255.).to(DEVICE)
@@ -86,32 +85,32 @@ def eval(args):
         img_tilde, eval_likelihoods, _ = coder(aligned_img)
         eval_img_tilde = align.resume(img_tilde)
 
-        decode_time = time.perf_counter() - t0
+        eval_time = time.perf_counter() - t0
         save_image(eval_img_tilde, save_name)
 
         eval_rate = estimate_bpp(eval_likelihoods, input=eval_img)
         eval_img = eval_img.mul(255.).clamp(0, 255).round()
         eval_img_tilde = eval_img_tilde.mul(255.).clamp(0, 255).round()
 
-        eval_psnr = psnr(eval_img_tilde, eval_img)
-        eval_msssim = ms_ssim(eval_img_tilde, eval_img)
+        eval_psnr = psnr(eval_img_tilde, eval_img).item()
+        eval_msssim = ms_ssim(eval_img_tilde, eval_img).item()
 
         print("{}:: PSNR: {:2.4f}, MS-SSIM: {:.4f}, rate: {:.4f}/{:.3f}(s)".format(
-            img_name, eval_psnr, eval_msssim, eval_rate.item(), decode_time
+            img_name, eval_psnr, eval_msssim, eval_rate.item(), eval_time
         ))
 
         eval_psnr_list.append(eval_psnr)
         eval_msssim_list.append(eval_msssim)
-        eval_rate_list.append(eval_rate)
-        dec_time_list.append(decode_time)
+        eval_rate_list.append(eval_rate.item())
+        eval_time_list.append(eval_time)
 
     if len(eval_rate_list) > 1:
         print("==========avg. performance==========")
-        print("PSNR: {:.4f}, MS-SSIM: {:.4f}, rate: {:.4f}, dec_time: {:.4f}".format(
+        print("PSNR: {:.4f}, MS-SSIM: {:.4f}, rate: {:.4f}, eval_time: {:.4f}".format(
             np.mean(eval_psnr_list),
             np.mean(eval_msssim_list),
             np.mean(eval_rate_list),
-            np.mean(dec_time_list)
+            np.mean(eval_time_list)
         ))
 
 
@@ -135,14 +134,14 @@ def compress(args):
         sidefile_name = os.path.join(args.target_dir, img_name + ".anifcside")
         t0 = time.perf_counter()
         eval_img = eval_img.to(DEVICE)
+        coder.conditional_bottleneck._set_context_tmp(file_name)
 
         with BitStreamIO(sidefile_name, 'w') as fp:
             stream_list, shape_list = coder.compress(align.align(eval_img))
             if len(stream_list[0]) == 2:
-                tmp, minmax = stream_list.pop(0)
+                _, minmax = stream_list.pop(0)
                 shape_list.append((1, 1, 1, minmax))
             fp.write(stream_list, [eval_img.size()]+shape_list)
-            move(tmp, file_name)
 
         encode_time = time.perf_counter() - t0
 
@@ -184,10 +183,9 @@ def decompress(args):
         t0 = time.perf_counter()
 
         with BitStreamIO(sidefile_name, 'r') as fp:
-            copyfile(file_name, "/tmp/context.tmp")
             stream_list, shape_list = fp.read_file()
             minmax = shape_list.pop(-1)[-1]
-            stream_list.insert(0, ("/tmp/context.tmp", minmax))
+            stream_list.insert(0, (file_name, minmax))
             eval_img_tilde = coder.decompress(stream_list, shape_list[1:])
             eval_img_tilde = align.resume(
                 eval_img_tilde, shape=shape_list[0])

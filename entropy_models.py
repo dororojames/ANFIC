@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import torchac as ac
+import torchac.torchac as ac
 from functional import lower_bound, quantize
 
 __version__ = '0.9.6'

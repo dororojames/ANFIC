@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -96,6 +98,9 @@ class ContextModel(nn.Module):
         condition = self.reparam(torch.cat([masked, phi], dim=1))
         self.entropy_model._set_condition(condition)
 
+    def _set_context_tmp(self, file_name):
+        self.tmp_file = file_name
+
     def get_cdf(self, samples):
         pmf = self.entropy_model._likelihood(samples)
         pmf_clip = pmf.clamp(1.0/65536, 1.0)
@@ -127,8 +132,7 @@ class ContextModel(nn.Module):
         condition = condition.to(symbols.device)
 
         fsymbols = self.mask.pad(fsymbols)
-        tmp_file = "/tmp/context.tmp"
-        encoder = RangeEncoder(tmp_file)
+        encoder = RangeEncoder(self.tmp_file)
         elems = np.arange(np.prod(input.size()))
         pbar = tqdm(elems, total=len(elems),
                     desc="context encode", unit="elem(s)")
@@ -155,9 +159,9 @@ class ContextModel(nn.Module):
         pbar.close()
 
         if return_sym:
-            return (tmp_file, minmax), self.entropy_model.dequantize(self.mask.crop(fsymbols, windows=(H, W))).to(input.device)
+            return (self.tmp_file, minmax), self.entropy_model.dequantize(self.mask.crop(fsymbols, windows=(H, W))).to(input.device)
         else:
-            return (tmp_file, minmax)
+            return (self.tmp_file, minmax)
 
     @torch.no_grad()
     def compress1(self, input, condition, return_sym=False):
@@ -185,8 +189,7 @@ class ContextModel(nn.Module):
 
         cdf = self.get_cdf(samples)
 
-        tmp_file = "/tmp/context.tmp"
-        encoder = RangeEncoder(tmp_file)
+        encoder = RangeEncoder(self.tmp_file)
         elems = np.arange(np.prod(input.size()))
         pbar = tqdm(elems, total=len(elems),
                     desc="context encode", unit="elem(s)")
@@ -205,9 +208,9 @@ class ContextModel(nn.Module):
         pbar.close()
 
         if return_sym:
-            return (tmp_file, minmax), self.entropy_model.dequantize(self.mask.crop(symbols, windows=(H, W)))
+            return (self.tmp_file, minmax), self.entropy_model.dequantize(self.mask.crop(symbols, windows=(H, W)))
         else:
-            return (tmp_file, minmax)
+            return (self.tmp_file, minmax)
 
     @torch.no_grad()
     def decompress(self, strings, shape, condition):
