@@ -81,6 +81,7 @@ def eval(args):
         save_name = os.path.join(args.target_dir, img_name+"_rec.png")
         t0 = time.perf_counter()
 
+        eval_img = eval_img.to(DEVICE)
         aligned_img = align.align(eval_img)
         img_tilde, eval_likelihoods, _ = coder(aligned_img)
         eval_img_tilde = align.resume(img_tilde)
