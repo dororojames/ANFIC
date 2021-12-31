@@ -131,23 +131,18 @@ def compress(args):
     for eval_img, img_path in test_dataloader:
         img_name = os.path.basename(img_path[0][:-4])
         file_name = os.path.join(args.target_dir, img_name + ".anifc")
-        sidefile_name = os.path.join(args.target_dir, img_name + ".anifcside")
         t0 = time.perf_counter()
         eval_img = eval_img.to(DEVICE)
-        coder.conditional_bottleneck._set_context_tmp(file_name)
 
-        with BitStreamIO(sidefile_name, 'w') as fp:
+        with BitStreamIO(file_name, 'w') as fp:
             stream_list, shape_list = coder.compress(align.align(eval_img))
-            if len(stream_list[0]) == 2:
-                _, minmax = stream_list.pop(0)
-                shape_list.append((1, 1, 1, minmax))
             fp.write(stream_list, [eval_img.size()]+shape_list)
 
         encode_time = time.perf_counter() - t0
 
         if args.eval:
-            eval_rate = (os.path.getsize(file_name) + os.path.getsize(
-                sidefile_name)) * 8 / (eval_img.size(2) * eval_img.size(3))
+            eval_rate = os.path.getsize(
+                file_name) * 8 / (eval_img.size(2) * eval_img.size(3))
 
             print("{}:: rate: {:.4f}/{:.3f}(s)".format(
                 img_name, eval_rate, encode_time))
@@ -178,14 +173,11 @@ def decompress(args):
 
     for file_name in file_name_list:
         img_name = os.path.basename(file_name)[:-6]
-        sidefile_name = os.path.join(args.source_dir, img_name + ".anifcside")
         save_name = os.path.join(args.target_dir, img_name+".png")
         t0 = time.perf_counter()
 
-        with BitStreamIO(sidefile_name, 'r') as fp:
+        with BitStreamIO(file_name, 'r') as fp:
             stream_list, shape_list = fp.read_file()
-            minmax = shape_list.pop(-1)[-1]
-            stream_list.insert(0, (file_name, minmax))
             eval_img_tilde = coder.decompress(stream_list, shape_list[1:])
             eval_img_tilde = align.resume(
                 eval_img_tilde, shape=shape_list[0])
@@ -200,8 +192,8 @@ def decompress(args):
 
             eval_psnr = PSNR_np(eval_img, eval_img_np, data_range=255.)
             eval_msssim = MultiScaleSSIM(eval_img[None], eval_img_np[None])
-            eval_rate = (os.path.getsize(file_name) + os.path.getsize(
-                sidefile_name)) * 8 / (eval_img.shape[0] * eval_img.shape[1])
+            eval_rate = os.path.getsize(
+                file_name) * 8 / (eval_img.shape[0] * eval_img.shape[1])
 
             print("{}:: PSNR: {:2.4f}, MS-SSIM: {:.4f}, rate: {:.4f}/{:.3f}(s)".format(
                 img_name, eval_psnr, eval_msssim, eval_rate, decode_time

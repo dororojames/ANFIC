@@ -1,15 +1,12 @@
-import os
-
 import numpy as np
 import torch
 import torch.nn.functional as F
-from range_coder import RangeDecoder, RangeEncoder
 from torch import nn
 from tqdm import tqdm
 
-from entropy_models import SymmetricConditional
+from entropy_models import SymmetricConditional, ac
 
-__version__ = '0.9.6'
+__version__ = '1.0.0'
 
 
 class MaskedConv2d(nn.Conv2d):
@@ -98,14 +95,12 @@ class ContextModel(nn.Module):
         condition = self.reparam(torch.cat([masked, phi], dim=1))
         self.entropy_model._set_condition(condition)
 
-    def _set_context_tmp(self, file_name):
-        self.tmp_file = file_name
-
     def get_cdf(self, samples):
         pmf = self.entropy_model._likelihood(samples)
         pmf_clip = pmf.clamp(1.0/65536, 1.0)
         pmf_clip = (pmf_clip / pmf_clip.sum(0, keepdim=True)*65536).round()
-        return torch.cumsum(pmf_clip, dim=0).squeeze()
+        cdf = torch.cumsum(pmf_clip, dim=0).squeeze()
+        return torch.cat([cdf[:1], cdf], 0).t().short()
 
     @torch.no_grad()
     def compress(self, input, condition, return_sym=False):
@@ -125,14 +120,13 @@ class ContextModel(nn.Module):
         symbols = self.entropy_model.quantize(input, "symbols").cpu()
         fsymbols = symbols.float()
 
-        B, C, H, W = symbols.size()
+        H, W = symbols.size()[-2:]
         minmax = max(symbols.max().abs(), symbols.min().abs())
         minmax = int(minmax.cpu().clamp_min(1))
         samples = torch.arange(0, minmax*2+1).view(-1, 1, 1, 1)-minmax
         condition = condition.to(symbols.device)
 
         fsymbols = self.mask.pad(fsymbols)
-        encoder = RangeEncoder(self.tmp_file)
         elems = np.arange(np.prod(input.size()))
         pbar = tqdm(elems, total=len(elems),
                     desc="context encode", unit="elem(s)")
@@ -143,74 +137,20 @@ class ContextModel(nn.Module):
                 patch_phi = self.mask.crop(condition, (h_idx, w_idx), 1)
 
                 self._set_condition(patch, patch_phi, padding=False)
-
-                currents = self.mask.crop(patch, windows=1).squeeze()
                 cdf = self.get_cdf(samples)
 
-                for c_idx in range(C):
-                    symbol = np.int(currents[c_idx] + minmax)
-                    cdf_ = [0] + [int(i) for i in cdf[:, c_idx]]
+                symbols = self.mask.crop(patch, windows=1).squeeze() + minmax
+                ac.range_encode(symbols.short(), cdf)
 
-                    encoder.encode([symbol], cdf_)
+                pbar.update(n=symbols.numel())
 
-                    pbar.update()
-
-        encoder.close()
         pbar.close()
+        string = ac.flush() + b'\x42\xE5\x34\x92' + np.uint8(minmax).tobytes()
 
         if return_sym:
-            return (self.tmp_file, minmax), self.entropy_model.dequantize(self.mask.crop(fsymbols, windows=(H, W))).to(input.device)
+            return string, self.entropy_model.dequantize(self.mask.crop(fsymbols, windows=(H, W))).to(input.device)
         else:
-            return (self.tmp_file, minmax)
-
-    @torch.no_grad()
-    def compress1(self, input, condition, return_sym=False):
-        """Compress input and store their binary representations into strings.
-
-        Arguments:
-            input: `Tensor` with values to be compressed.
-
-        Returns:
-            compressed: String `Tensor` vector containing the compressed
-                representation of each batch element of `input`.
-
-        Raises:
-            ValueError: if `input` has an integral or inconsistent `DType`, or
-                inconsistent number of channels.
-        """
-        symbols = self.entropy_model.quantize(input, "symbols").cpu()
-
-        self._set_condition(symbols.float(), condition.cpu())
-
-        B, C, H, W = symbols.size()
-        minmax = max(symbols.max().abs(), symbols.min().abs())
-        minmax = int(minmax.cpu().clamp_min(1))
-        samples = torch.arange(0, minmax*2+1).view(-1, 1, 1, 1)-minmax
-
-        cdf = self.get_cdf(samples)
-
-        encoder = RangeEncoder(self.tmp_file)
-        elems = np.arange(np.prod(input.size()))
-        pbar = tqdm(elems, total=len(elems),
-                    desc="context encode", unit="elem(s)")
-
-        for h_idx in range(H):
-            for w_idx in range(W):
-                for c_idx in range(C):
-                    symbol = np.int(symbols[0, c_idx, h_idx, w_idx] + minmax)
-                    cdf_ = [0] + [int(i) for i in cdf[:, c_idx, h_idx, w_idx]]
-
-                    encoder.encode([symbol], cdf_)
-
-                    pbar.update()
-
-        encoder.close()
-        pbar.close()
-
-        if return_sym:
-            return (self.tmp_file, minmax), self.entropy_model.dequantize(self.mask.crop(symbols, windows=(H, W)))
-        else:
-            return (self.tmp_file, minmax)
+            return string
 
     @torch.no_grad()
     def decompress(self, strings, shape, condition):
@@ -222,16 +162,16 @@ class ContextModel(nn.Module):
         Returns:
             The decompressed `Tensor`.
         """
-        B, C, H, W = [int(s) for s in shape]
-        assert B == 1
+        H, W = shape[-2:]
 
-        tmp_file, minmax = strings
+        string, minmax = strings.split(b'\x42\xE5\x34\x92')
+        minmax = np.frombuffer(minmax, np.uint8)[0]
         samples = torch.arange(0, minmax*2+1).view(-1, 1, 1, 1)-minmax
         device = condition.device
         condition = condition.to("cpu")
 
         input = self.mask.pad(torch.zeros(size=shape, device=condition.device))
-        decoder = RangeDecoder(tmp_file)
+        ac.set_string(string)
         elems = np.arange(np.prod(shape))
         pbar = tqdm(elems, total=len(elems),
                     desc="context decode", unit="elem(s)")
@@ -242,22 +182,14 @@ class ContextModel(nn.Module):
                 patch_phi = self.mask.crop(condition, (h_idx, w_idx), 1)
 
                 self._set_condition(patch, patch_phi, padding=False)
-
                 cdf = self.get_cdf(samples)
-                recs = []
 
-                for c_idx in range(C):
-                    cdf_ = [0] + [int(i) for i in cdf[:, c_idx]]
-
-                    recs.append(decoder.decode(1, cdf_)[0])
-
-                    pbar.update()
-
-                rec = self.entropy_model.dequantize(
-                    torch.Tensor(recs) - minmax)
+                recs = ac.range_decode(cdf).float()
+                rec = self.entropy_model.dequantize(recs - minmax)
                 input[0, :, h_idx+2, w_idx+2].copy_(rec)
 
-        decoder.close()
+                pbar.update(n=recs.numel())
+
         pbar.close()
 
         return self.mask.crop(input, windows=(H, W)).to(device)

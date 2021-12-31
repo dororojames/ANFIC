@@ -1,51 +1,14 @@
 import numbers
-import random
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-import torchac.torchac as ac
+from torchac.torchac import ac
 from functional import lower_bound, quantize
 
-__version__ = '0.9.6'
-
-
-def get_coder_params(m):
-    """get coder parameters and quantiles"""
-    params, quants = [], []
-    if isinstance(m, list):
-        for _m in m:
-            p, q = get_coder_params(_m)
-            params += p
-            quants += q
-    else:
-        for name, param in m.named_parameters(recurse=True):
-            if 'quantiles' in name:
-                quants.append(param)
-            else:
-                params.append(param)
-
-    return params, quants
-
-
-def get_coder_named_params(m):
-    """get coder parameters and quantiles"""
-    params, quants = [], []
-    if isinstance(m, list):
-        for _m in m:
-            p, q = get_coder_params(_m)
-            params += p
-            quants += q
-    else:
-        for name, param in m.named_parameters(recurse=True):
-            if 'quantiles' in name:
-                quants.append((name, param))
-            else:
-                params.append((name, param))
-
-    return params, quants
+__version__ = '1.0.0'
 
 
 def estimate_bpp(likelihood, num_pixels=None, input=None, likelihood_bound: float = 1e-9):
@@ -138,9 +101,12 @@ class EntropyModel(nn.Module):
             return input
         if mode == 'UQ' and self.training:
             noise = torch.empty(input.size(0)).uniform_(-0.5, 0.5)
-            self.noise = noise.view(-1, 1, 1, 1).to(input.device)
+            self.noise = noise.view(-1, *[1]*(input.dim()-1)).to(input.device)
             # print("A")
             input = input + self.noise
+
+        if mean is not None and mean.dim() != input.dim():
+            mean = mean.reshape(1, -1, *[1]*(input.dim()-2))
 
         outputs = quantize(input, mode, mean)
 
@@ -165,6 +131,8 @@ class EntropyModel(nn.Module):
         """
         outputs = input.float()
         if mean is not None:
+            if mean.dim() != input.dim():
+                mean = mean.reshape(1, -1, *[1]*(input.dim()-2))
             outputs = outputs + mean
         if self.noise is not None and self.training:
             # print("B")
@@ -206,18 +174,14 @@ class EntropyModel(nn.Module):
             ValueError: if `input` has an integral or inconsistent `DType`, or
                 inconsistent number of channels.
         """
-        B, C, H, W = input.size()
-        assert B == 1
-
         self._set_condition(condition)
 
         symbols = self.quantize(input, "symbols", self.mean)
 
-        cdf, cdf_length, offset, idx = self.get_cdf((B, C, H, W))  # CxL
+        cdf, cdf_length, offset, idx = self.get_cdf(input.size())  # CxL
         assert symbols.dtype == cdf.dtype == cdf_length.dtype == offset.dtype == idx.dtype == ac.dtype
 
         strings = ac.range_index_encode(symbols - offset, cdf, cdf_length, idx)
-        # print(len(strings))
 
         if return_sym:
             return strings, self.dequantize(symbols, self.mean)
@@ -234,12 +198,9 @@ class EntropyModel(nn.Module):
         Returns:
             The decompressed `Tensor`.
         """
-        B, C, H, W = [int(s) for s in shape]
-        assert B == 1
-
         self._set_condition(condition)
 
-        cdf, cdf_length, offset, idx = self.get_cdf((B, C, H, W))  # CxL
+        cdf, cdf_length, offset, idx = self.get_cdf(shape)  # CxL
         assert cdf.dtype == cdf_length.dtype == offset.dtype == idx.dtype == ac.dtype
 
         symbols = ac.range_index_decode(strings, cdf, cdf_length, idx)
@@ -471,7 +432,6 @@ class EntropyBottleneck(EntropyModel):
                 pmf[idx, c].clamp_min_(2 ** -15)
 
         pmf = F.normalize(pmf, p=1., dim=0)
-        # print(pmf.t()[:5])
 
         # Compute out-of-range (tail) masses.
         tail_mass = torch.sigmoid(lower[:1]) + torch.sigmoid(-upper[-1:])
@@ -480,19 +440,19 @@ class EntropyBottleneck(EntropyModel):
 
         for c in range(self.num_features):
             pmf[pmf_length[c], c] = tail_mass[0, c]
-        # print(pmf.t()[:5])
 
         self._cdf = ac.pmf2cdf(pmf.t())  # CxL
-        # print(self._cdf[:5])
         self._cdf_length = pmf_length.short().to('cpu', non_blocking=True)
-        self._offset = -minima.view(1, -1, 1, 1).short()
-        self.idx = torch.arange(self.num_features).view(
-            1, -1, 1, 1).short()
+        self._offset = -minima.view(1, -1).short()
+        self.idx = torch.arange(self.num_features).view(1, -1).short()
 
     @torch.no_grad()
     def get_cdf(self, shape):
         if self.training or self._cdf is None:
             self._cal_base_cdf()
+            if self._offset.dim() != len(shape):
+                self._offset = self._offset.reshape(1, -1, *[1]*(len(shape)-2))
+                self.idx = self.idx.reshape(1, -1, *[1]*(len(shape)-2))
         # use saved cdf
         return self._cdf, self._cdf_length, self._offset, self.idx.expand(shape)
 
@@ -545,7 +505,7 @@ class SymmetricConditional(EntropyModel):
 
     def _set_condition(self, condition):
         assert condition is not None, f'{self.__class__.__name__} should given condition'
-        assert condition.dim() == 4 and condition.size(1) % self.condition_size == 0
+        assert condition.dim() > 2 and condition.size(1) % self.condition_size == 0
         if self.use_mean:
             self.mean, self.scale = condition.chunk(2, dim=1)
         else:
@@ -602,7 +562,7 @@ class SymmetricConditional(EntropyModel):
         multiplier = -self._standardized_quantile(t)
         pmf_center = torch.ceil(scale_table * multiplier)
 
-        self._offset = -pmf_center.view(1, 1, 1, -1)
+        self._offset = -pmf_center
         pmf_length = 2 * pmf_center.short() + 1
         self._cdf_length = pmf_length.to('cpu', non_blocking=True)
 
@@ -634,24 +594,14 @@ class SymmetricConditional(EntropyModel):
 
         self._cdf = ac.pmf2cdf(pmf)
 
-    @staticmethod
-    def sample(input, grid):
-        return F.grid_sample(input, grid, mode='nearest', align_corners=True).permute(0, 2, 3, 1)
-
     @torch.no_grad()
     def get_cdf(self, shape=None):
         if self._cdf is None:
             self._cal_base_cdf(device=self.scale.device)
 
-        B, C, H, W = self.scale.size()
-        assert B == 1
-        scale = self.scale.view(1, C, -1, 1)
-
-        idx = (scale.log() - self.idxmin) / (self.idxmax - self.idxmin)
-        grid = torch.cat([idx * 2, torch.zeros_like(scale)], dim=-1) - 1
-
-        offset = self.sample(self._offset, grid).view(1, C, H, W)
-        idx = idx.mul(self.SCALES_LEVELS-1).round().view(1, C, H, W)
+        idx = (self.scale.log() - self.idxmin) / (self.idxmax - self.idxmin)
+        idx = idx.clamp_max(1).mul(self.SCALES_LEVELS-1).round()
+        offset = self._offset[idx.long()]
 
         return self._cdf, self._cdf_length, offset.short(), idx.short()
 
@@ -747,9 +697,9 @@ class MixtureModelConditional(SymmetricConditional):
 
     def _set_condition(self, condition):
         assert condition is not None, f'{self.__class__.__name__} should given condition'
-        assert condition.dim() == 4 and condition.size(1) % self.condition_size == 0
-        B, NKC, H, W = condition.size()
-        shape = (B, 3, self.K, NKC//3//self.K, H, W)
+        assert condition.dim() > 2 and condition.size(1) % self.condition_size == 0
+        B, NKC = condition.size()[:2]
+        shape = (B, 3, self.K, NKC//3//self.K) + tuple(condition.size()[2:])
         self.mean, self.scale, self.pi = condition.view(*shape).unbind(1)
         self.scale = lower_bound(self.scale, self.scale_bound)
         self.pi = self.pi.softmax(dim=1)
@@ -759,8 +709,12 @@ class MixtureModelConditional(SymmetricConditional):
         return self.mean, self.scale, self.pi
 
     @torch.no_grad()
-    def get_cdf(self):
-        raise NotImplementedError()
+    def get_cdf(self, samples):
+        pmf = self._likelihood(samples)
+        pmf_clip = pmf.clamp(1.0/65536, 1.0)
+        pmf_clip = (pmf_clip / pmf_clip.sum(0, keepdim=True)*65536).round()
+        cdf = torch.cumsum(pmf_clip, dim=0).squeeze()
+        return torch.cat([cdf[:1], cdf], 0)
 
     def quantize(self, input, mode, mean_holder=None):
         return super().quantize(input, mode)
